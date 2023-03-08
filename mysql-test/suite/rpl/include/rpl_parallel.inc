@@ -17,6 +17,7 @@ SET @old_parallel_threads=@@GLOBAL.slave_parallel_threads;
 SET GLOBAL slave_parallel_threads=10;
 --source include/stop_slave.inc
 SET GLOBAL slave_parallel_threads=10;
+--let $slave_timeout=10
 
 # Check that we do not spawn any worker threads when no slave is running.
 SELECT IF(COUNT(*) < 10, "OK", CONCAT("Found too many system user processes: ", COUNT(*))) FROM information_schema.processlist WHERE user = "system user";
@@ -952,6 +953,9 @@ eval KILL $d1_thd_id;
 # Wait until T3 has reacted on the kill.
 SET debug_sync='now WAIT_FOR t3_killed';
 
+--let $wait_condition= select count(*)=1 from information_schema.processlist where state LIKE 'Killing slave' and command='Slave_SQL'
+--source include/wait_condition.inc
+
 # Now we can allow T1 to proceed.
 SET debug_sync='now SIGNAL t1_cont';
 
@@ -959,10 +963,12 @@ SET debug_sync='now SIGNAL t1_cont';
 --source include/wait_for_slave_sql_error.inc
 STOP SLAVE IO_THREAD;
 # Since T2, T3, and T4 run in parallel, we can not be sure if T2 will have time
-# to commit or not before the stop. However, T1 should commit, and T3/T4 may
+# to commit or not before the stop. However, T1 should rollback, and T3/T4 may
 # not have committed. (After slave restart we check that all become committed
 # eventually).
 SELECT * FROM t3 WHERE a >= 60 AND a != 65 ORDER BY a;
+
+#die examine;
 
 # Now we have to disable the debug_sync statements, so they do not trigger
 # when the events are retried.
@@ -1075,6 +1081,14 @@ SET binlog_format=@old_format;
 --connection server_2
 SET debug_sync='RESET';
 --source include/start_slave.inc
+
+# Test amendment from MDEV-13915:
+# A worker thread's event queue is no longer executed on replica stop.
+# The signal query_cont needs to be re-sent because the transaction was
+# aborted.
+SET debug_sync='now WAIT_FOR query_waiting';
+SET debug_sync='now SIGNAL query_cont';
+
 --sync_with_master
 SELECT * FROM t3 WHERE a >= 80 ORDER BY a;
 
@@ -1407,7 +1421,7 @@ SET debug_sync='RESET';
 
 
 --connection server_2
---let $slave_sql_errno= 1317
+--let $slave_sql_errno= 1317,1593
 --source include/wait_for_slave_sql_error.inc
 STOP SLAVE IO_THREAD;
 --replace_result $after_error_gtid_pos AFTER_ERROR_GTID_POS
