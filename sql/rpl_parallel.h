@@ -160,6 +160,7 @@ struct rpl_parallel_thread {
   /* These keep track of batch update of inuse_relaylog refcounts. */
   inuse_relaylog *accumulated_ir_last;
   uint64 accumulated_ir_count;
+  bool abort_synchronization_needed;
 
   void enqueue(queued_event *qev)
   {
@@ -255,6 +256,7 @@ struct rpl_parallel_thread_pool {
 struct rpl_parallel_entry {
   mysql_mutex_t LOCK_parallel_entry;
   mysql_cond_t COND_parallel_entry;
+  mysql_cond_t COND_parallel_abort;
   uint32 domain_id;
   /*
     Incremented by wait_for_workers_idle() and rpl_pause_for_ftwrl() to show
@@ -346,10 +348,24 @@ struct rpl_parallel_entry {
   /* The group_commit_orderer object for the events currently being queued. */
   group_commit_orderer *current_gco;
 
+  uint64 count_threads_to_sync_abort;
+  bool abort_ready;
+
+  std::atomic<uint64> unsafe_rollback_marker_sub_id;
+  /*
+    I started my implementation with this as an atomic, but I think it needs
+    to be mutex-synchronized.
+  */
+  Atomic_counter<uint64> count_workers_ready_for_abort;
+  bool abort_synchronized;
+
   rpl_parallel_thread * choose_thread(rpl_group_info *rgi, bool *did_enter_cond,
                                       PSI_stage_info *old_stage, bool reuse);
   int queue_master_restart(rpl_group_info *rgi,
                            Format_description_log_event *fdev);
+  bool synchronize_abort(rpl_group_info *rgi= NULL, Log_event *ev= NULL);
+  void unrequire_abort_participation();
+  void rerequire_abort_participation();
 };
 struct rpl_parallel {
   HASH domain_hash;

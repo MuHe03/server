@@ -7464,6 +7464,18 @@ void THD::set_last_commit_gtid(rpl_gtid &gtid)
 #endif
 }
 
+int THD::wait_for_prior_commit()
+{
+  int ret= 0;
+  if (wait_for_commit_ptr)
+  {
+    rgi_slave->parallel_entry->unrequire_abort_participation();
+    ret= wait_for_commit_ptr->wait_for_prior_commit(this);
+    rgi_slave->parallel_entry->rerequire_abort_participation();
+  }
+  return ret;
+}
+
 void
 wait_for_commit::reinit()
 {

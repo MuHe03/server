@@ -26,7 +26,7 @@
 struct rpl_parallel_thread_pool global_rpl_thread_pool;
 
 static void signal_error_to_sql_driver_thread(THD *thd, rpl_group_info *rgi,
-                                              int err);
+                                              int err, bool cleanup= true);
 
 static int
 rpt_handle_event(rpl_parallel_thread::queued_event *qev,
@@ -275,17 +275,22 @@ finish_event_group(rpl_parallel_thread *rpt, uint64 sub_id,
   wfc->wakeup_subsequent_commits(rgi->worker_error);
 }
 
-
-static void
-signal_error_to_sql_driver_thread(THD *thd, rpl_group_info *rgi, int err)
+static void signal_error_to_sql_driver_thread(THD *thd, rpl_group_info *rgi,
+                                              int err, bool cleanup)
 {
   rgi->worker_error= err;
+  rgi->unmark_start_commit();
+
+  if (rgi->modified_non_trans_table)
+    slave_output_incomplete_trx_non_trans_err(thd, rgi);
+
+  if (cleanup)
+    rgi->cleanup_context(thd, true);
+
   /*
     In case we get an error during commit, inform following transactions that
     we aborted our commit.
   */
-  rgi->unmark_start_commit();
-  rgi->cleanup_context(thd, true);
   rgi->rli->abort_slave= true;
   rgi->rli->stop_for_until= false;
   mysql_mutex_lock(rgi->rli->relay_log.get_log_lock());
@@ -533,7 +538,6 @@ rpl_unpause_after_ftwrl(THD *thd)
       continue;
     }
     e= rpt->current_entry;
-    mysql_mutex_lock(&e->LOCK_parallel_entry);
     rpt->pause_for_ftwrl = false;
     mysql_mutex_unlock(&rpt->LOCK_rpl_thread);
     /*
@@ -1174,7 +1178,6 @@ handle_rpl_parallel_thread(void *arg)
           in_event_group= false;
           finish_event_group(rpt, group_rgi->gtid_sub_id,
                              qev->entry_for_queued, group_rgi);
-
           rpt->loc_free_rgi(group_rgi);
           thd->rgi_slave= group_rgi= NULL;
         }
@@ -1362,8 +1365,37 @@ handle_rpl_parallel_thread(void *arg)
             thd->send_kill_message();
             err= 1;
           }
+          /*
+            Perhaps we can do this whole check in sql_slave_killed(), but it
+            would need a rewrite (or perhaps in MDEV-30458?)
+          */
+          else if (((unlikely(entry->force_abort) &&
+                     !rgi->rli->stop_for_until)) &&
+                   entry->synchronize_abort(rgi, qev->ev))
+          {
+            if (!err && rgi->gtid_sub_id <=
+                            entry->unsafe_rollback_marker_sub_id.load())
+              err= ER_SLAVE_FATAL_ERROR;
+            signal_error_to_sql_driver_thread(thd, rgi, err);
+          }
           else
+          {
+            /*
+              In the event of STOP SLAVE, we don't want to synchronize threads
+              ending an event group, as their non-transactional effects have
+              already been observed, and they may wait for group commit or
+              prior transaction completion.
+            */
+            if (group_ending)
+              entry->unrequire_abort_participation();
+
             err= rpt_handle_event(qev, rpt);
+            rgi->modified_non_trans_table |= thd->transaction.all.modified_non_trans_table;
+
+            if (group_ending)
+              entry->rerequire_abort_participation();
+
+          }
         }
         delete_or_keep_event_post_apply(rgi, event_type, qev->ev);
         DBUG_EXECUTE_IF("rpl_parallel_simulate_temp_err_gtid_0_x_100",
@@ -1377,6 +1409,10 @@ handle_rpl_parallel_thread(void *arg)
       }
       else
       {
+        if (entry->force_abort && !entry->abort_synchronized)
+        {
+          entry->synchronize_abort(rgi, qev->ev);
+        }
         delete qev->ev;
         thd->get_stmt_da()->set_overwrite_status(true);
         err= thd->wait_for_prior_commit();
@@ -1406,7 +1442,22 @@ handle_rpl_parallel_thread(void *arg)
         rpt->loc_free_rgi(rgi);
         thd->rgi_slave= group_rgi= rgi= NULL;
         skip_event_group= false;
+        if (unlikely(entry->force_abort) &&
+            !entry->abort_synchronized)
+        {
+          entry->synchronize_abort();
+        }
+
         DEBUG_SYNC(thd, "rpl_parallel_end_of_group");
+      }
+      else if (thd->transaction.all.modified_non_trans_table)
+      {
+        uint64 last_unsafe_rollback_sub_id=
+            entry->unsafe_rollback_marker_sub_id.load();
+        while (rgi->gtid_sub_id > last_unsafe_rollback_sub_id &&
+               !entry->unsafe_rollback_marker_sub_id.compare_exchange_weak(
+                   last_unsafe_rollback_sub_id, rgi->gtid_sub_id))
+        {}
       }
     }
 
@@ -1443,7 +1494,8 @@ handle_rpl_parallel_thread(void *arg)
         half-processed event group.
       */
       mysql_mutex_unlock(&rpt->LOCK_rpl_thread);
-      signal_error_to_sql_driver_thread(thd, group_rgi, 1);
+      signal_error_to_sql_driver_thread(thd, group_rgi, 1,
+        !thd->transaction.all.modified_non_trans_table);
       finish_event_group(rpt, group_rgi->gtid_sub_id,
                          group_rgi->parallel_entry, group_rgi);
       in_event_group= false;
@@ -1607,6 +1659,7 @@ rpl_parallel_change_thread_count(rpl_parallel_thread_pool *pool,
     mysql_cond_init(key_COND_rpl_thread_stop,
                     &new_list[i]->COND_rpl_thread_stop, NULL);
     new_list[i]->pool= pool;
+    new_list[i]->abort_synchronization_needed= false;
     if (mysql_thread_create(key_rpl_parallel_thread, &th, &connection_attrib,
                             handle_rpl_parallel_thread, new_list[i]))
     {
@@ -2236,6 +2289,7 @@ free_rpl_parallel_entry(void *element)
   }
   mysql_cond_destroy(&e->COND_parallel_entry);
   mysql_mutex_destroy(&e->LOCK_parallel_entry);
+  mysql_cond_destroy(&e->COND_parallel_abort);
   my_free(e);
 }
 
@@ -2290,6 +2344,16 @@ rpl_parallel::find(uint32 domain_id)
     e->domain_id= domain_id;
     e->stop_on_error_sub_id= (uint64)ULONGLONG_MAX;
     e->pause_sub_id= (uint64)ULONGLONG_MAX;
+
+    /*
+      0 initialized because the comparison check can't allow for lessening the
+      commit trx, only to push the limit further back
+    */
+    e->unsafe_rollback_marker_sub_id= 0;
+    e->count_threads_to_sync_abort= 0;
+    e->abort_synchronized= false;
+    e->abort_ready= false;
+
     if (my_hash_insert(&domain_hash, (uchar *)e))
     {
       my_free(e);
@@ -2298,6 +2362,7 @@ rpl_parallel::find(uint32 domain_id)
     mysql_mutex_init(key_LOCK_parallel_entry, &e->LOCK_parallel_entry,
                      MY_MUTEX_INIT_FAST);
     mysql_cond_init(key_COND_parallel_entry, &e->COND_parallel_entry, NULL);
+    mysql_cond_init(key_COND_parallel_abort, &e->COND_parallel_abort, NULL);
   }
   else
     e->force_abort= false;
@@ -2316,6 +2381,7 @@ rpl_parallel::wait_for_done(THD *thd, Relay_log_info *rli)
 {
   struct rpl_parallel_entry *e;
   rpl_parallel_thread *rpt;
+  rpl_group_info *rgi;
   uint32 i, j;
 
   /*
@@ -2347,9 +2413,52 @@ rpl_parallel::wait_for_done(THD *thd, Relay_log_info *rli)
       need to continue executing any queued events up to that point.
     */
     e->force_abort= true;
+
+    /*
+      TODO Merge the old logic with the new
+    */
     e->stop_count= rli->stop_for_until ?
       e->count_queued_event_groups : e->count_committing_event_groups;
+
+    e->count_threads_to_sync_abort= 0;
     mysql_mutex_unlock(&e->LOCK_parallel_entry);
+
+    /*
+      Prepare the threads to synchronized abort.
+
+      Force_abort is first set (above) to stop threads from starting new
+      transactions. Now we go through our entry's threads to count how many
+      are actively working on transactions. While this is happening, the worker
+      threads may notice the force_abort, and will enter into a cond_wait until
+      we have finished collecting stop requirements. Once done, we broadcast to
+      these threads so they may continue to synchronize with one another to
+      establish a safe stop point, such that all transactions after this point
+      may be immediately stopped and rolled back.
+    */
+    for (j= 0; j < e->rpl_thread_max; ++j)
+    {
+      if ((rpt= e->rpl_threads[j]))
+      {
+        mysql_mutex_lock(&rpt->LOCK_rpl_thread);
+        if ((rgi= rpt->thd->rgi_slave) && (rpt->current_entry == e) &&
+            rgi->gtid_sub_id <= e->largest_started_sub_id)
+        {
+          e->count_threads_to_sync_abort++;
+          rpt->abort_synchronization_needed= true;
+        }
+        mysql_mutex_unlock(&rpt->LOCK_rpl_thread);
+      }
+    }
+
+    /*
+      Notify threads it is okay to synchronized abort, and release any threads
+      which are already waiting to.
+    */
+    mysql_mutex_lock(&e->LOCK_parallel_entry);
+    e->abort_ready= true;
+    mysql_cond_broadcast(&e->COND_parallel_abort);
+    mysql_mutex_unlock(&e->LOCK_parallel_entry);
+
     for (j= 0; j < e->rpl_thread_max; ++j)
     {
       if ((rpt= e->rpl_threads[j]))
@@ -2479,6 +2588,117 @@ rpl_parallel_entry::queue_master_restart(rpl_group_info *rgi,
   return 0;
 }
 
+
+void rpl_parallel_entry::unrequire_abort_participation()
+{
+  mysql_mutex_lock(&LOCK_parallel_entry);
+  /*
+    Safety check that STOP SLAVE was not issued, as if it was issued,
+    we want to participate at-least minimally. That is, if we are the last
+    thread to synchronize, we at least need to notify the remaining threads
+    to continue.
+  */
+  if (force_abort && !abort_synchronized)
+  {
+    mysql_mutex_unlock(&LOCK_parallel_entry);
+    /*
+      Return value doesn't matter, as the calling state for this function
+      doesn't permit early stop.
+    */
+    synchronize_abort();
+  }
+  else
+  {
+    ++count_workers_ready_for_abort;
+    mysql_mutex_unlock(&LOCK_parallel_entry);
+  }
+}
+
+void rpl_parallel_entry::rerequire_abort_participation()
+{
+  mysql_mutex_lock(&LOCK_parallel_entry);
+  --count_workers_ready_for_abort;
+  mysql_mutex_unlock(&LOCK_parallel_entry);
+}
+
+bool rpl_parallel_entry::synchronize_abort(rpl_group_info *rgi, Log_event *ev)
+{
+  bool do_abort= true;
+
+  if (!abort_synchronized)
+  {
+    PSI_stage_info old_stage;
+    uint64 my_worker_counter;
+
+    /*
+      Part 1: The SQL thread needs to coordinate the abort, so first check if
+      that process is still ongoing. If so, wait for it to finish
+    */
+    mysql_mutex_lock(&LOCK_parallel_entry);
+    if (!abort_ready)
+    {
+      /*
+        We will be signalled when the abort is done
+
+        TODO: make a new stage, so it isn't confused with the next cond_wait
+      */
+      rgi->thd->ENTER_COND(&COND_parallel_abort, &LOCK_parallel_entry,
+                      &stage_waiting_for_workers_abort, &old_stage);
+      mysql_cond_wait(&COND_parallel_abort, &LOCK_parallel_entry);
+      rgi->thd->EXIT_COND(&old_stage);
+    }
+    else
+    {
+      mysql_mutex_unlock(&LOCK_parallel_entry);
+    }
+
+
+    /*
+      Part 2: Running threads have been collected, now the threads need
+      to synchronize to establish a safe stopping point.
+    */
+    DBUG_ASSERT(abort_ready);
+    my_worker_counter= ++count_workers_ready_for_abort;
+    /*
+      LOCK_parallel_entry isn't needed for accessing count_threads_to_sync_abort,
+      as force_abort is already set so there is not potential race condition.
+    */
+    if (my_worker_counter >= count_threads_to_sync_abort)
+    {
+      abort_synchronized= true;
+      mysql_cond_broadcast(&COND_parallel_abort);
+    }
+    else if (rgi != NULL)
+    {
+      mysql_mutex_lock(&LOCK_parallel_entry);
+      rgi->thd->ENTER_COND(&COND_parallel_abort, &LOCK_parallel_entry,
+                      &stage_waiting_for_workers_abort, &old_stage);
+      mysql_cond_wait(&COND_parallel_abort, &LOCK_parallel_entry);
+      rgi->thd->EXIT_COND(&old_stage);
+    }
+  }
+
+  if (rgi)
+  {
+    THD *thd= rgi->thd;
+    bool rgi_should_try_to_complete=
+        unsafe_rollback_marker_sub_id.load() >= rgi->gtid_sub_id &&
+        !thd->transaction_rollback_request;
+
+    if (rgi_should_try_to_complete && !slave_done_waiting_to_force_abort(rgi))
+    {
+      /*
+        TODO create a function for this warning that slave_sql_killed() uses
+      */
+      rgi->rli->report(WARNING_LEVEL, 0, rgi->gtid_info(),
+                       "Request to stop slave SQL Thread received while "
+                       "applying a group that has non-transactional "
+                       "changes; waiting for completion of the group ... ");
+      do_abort= false;
+    }
+  }
+  return do_abort;
+}
 
 int
 rpl_parallel::wait_for_workers_idle(THD *thd)
