@@ -5830,6 +5830,7 @@ the generated partition syntax in a correct manner.
         } while (++part_count < tab_part_info->num_parts);
         tab_it.rewind();
         part_count= 0;
+        /* Update id after tab_it.replace() and tab_it.remove() */
         while (partition_element *el= tab_it++)
           el->id= part_count++;
         if (drop_count != num_parts_reorged)
