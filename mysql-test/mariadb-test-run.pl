@@ -201,6 +201,7 @@ my @DEFAULT_SUITES= qw(
     json-
     maria-
     mariabackup-
+    merge-
     multi_source-
     optimizer_unfixed_bugs-
     parts-
