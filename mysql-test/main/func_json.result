@@ -1043,5 +1043,14 @@ SELECT JSON_EXTRACT('{"a":null, "b":10, "c":"null"}', '$.a');
 JSON_EXTRACT('{"a":null, "b":10, "c":"null"}', '$.a')
 null
 #
+# MDEV-23187: Assorted assertion failures in json_find_path with certain collations
+#
+SET @save_collation_connection= @@collation_connection;
+SET COLLATION_CONNECTION= ucs2_unicode_ci;
+SELECT JSON_VALUE('["foo"]', '$**[0]') AS f;
+f
+foo
+SET COLLATION_CONNECTION= @save_collation_connection;
+#
 # End of 10.3 tests
 #

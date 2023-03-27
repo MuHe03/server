@@ -583,6 +583,12 @@ String *Item_func_json_value::val_str(String *str)
 {
   json_engine_t je;
   String *js= args[0]->val_json(&tmp_js);
+  uint errors;
+  size_t new_length= my_charset_latin1.mbmaxlen * js->length() / js->charset()->mbminlen;
+  char *to= (char*)alloc_root(current_thd->mem_root, new_length+1);
+  copy_and_convert(to, new_length, &my_charset_latin1,
+			                          js->ptr(), js->length(), js->charset(), &errors);
+  String js2((const char*)to, &my_charset_latin1);
   int error= 0;
   uint array_counters[JSON_DEPTH_LIMIT];
 
@@ -599,8 +605,8 @@ String *Item_func_json_value::val_str(String *str)
   if ((null_value= args[0]->null_value || args[1]->null_value))
     return NULL;
 
-  json_scan_start(&je, js->charset(),(const uchar *) js->ptr(),
-                  (const uchar *) js->ptr() + js->length());
+  json_scan_start(&je, js2.charset(),(const uchar *) js2.ptr(),
+                  (const uchar *) js2.ptr() + js2.length());
 
   str->length(0);
   str->set_charset(collation.collation);
