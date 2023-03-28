@@ -307,6 +307,7 @@ bool spider_mariadb_support_direct_join(
   DBUG_RETURN(TRUE);
 }
 
+/** Available `SPIDER_DBTON`s */
 SPIDER_DBTON spider_dbton_mysql = {
   0,
   SPIDER_DB_WRAPPER_MYSQL,
@@ -5316,6 +5317,7 @@ int spider_db_mbase_util::append_sql_mode(
   DBUG_RETURN(0);
 }
 
+/** Append `set session time_zone = ...` to query string */
 int spider_db_mbase_util::append_time_zone(
   spider_string *str,
   Time_zone *time_zone
@@ -5334,6 +5336,14 @@ int spider_db_mbase_util::append_time_zone(
   DBUG_RETURN(0);
 }
 
+/**
+  Append a query for self-referencing check.
+
+  The query is setting a user variable `@spider_lc$targe_table_path`
+  to the value of `"$spider_unique_id$spider_table_path-"`, where
+  $target_table_path is the path to the data node table ("to"), and
+  $spider_table_path the path to the spider table ("from").
+*/
 int spider_db_mbase_util::append_loop_check(
   spider_string *str,
   SPIDER_CONN *conn
@@ -12955,14 +12965,9 @@ int spider_mbase_handler::mk_bulk_tmp_table_and_bulk_start()
   DBUG_PRINT("info",("spider this=%p", this));
   if (!upd_tmp_tbl)
   {
-#ifdef SPIDER_use_LEX_CSTRING_for_Field_blob_constructor
     LEX_CSTRING field_name = {STRING_WITH_LEN("a")};
     if (!(upd_tmp_tbl = spider_mk_sys_tmp_table(
       thd, table, &upd_tmp_tbl_prm, &field_name, update_sql.charset())))
-#else
-    if (!(upd_tmp_tbl = spider_mk_sys_tmp_table(
-      thd, table, &upd_tmp_tbl_prm, "a", update_sql.charset())))
-#endif
     {
       DBUG_RETURN(HA_ERR_OUT_OF_MEM);
     }

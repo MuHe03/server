@@ -2670,31 +2670,22 @@ int spider_get_sys_tables_monitoring_binlog_pos_at_failing(
   DBUG_RETURN(error_num);
 }
 
-int spider_get_sys_tables_link_status(
-  TABLE *table,
-  SPIDER_SHARE *share,
-  int link_idx,
-  MEM_ROOT *mem_root
-) {
-  char *ptr;
-  int error_num = 0;
-  DBUG_ENTER("spider_get_sys_tables_link_status");
-  if ((ptr = get_field(mem_root, table->field[SPIDER_TABLES_LINK_STATUS_POS])))
-  {
-    share->link_statuses[link_idx] =
-      (long) my_strtoll10(ptr, (char**) NULL, &error_num);
-  } else
-    share->link_statuses[link_idx] = 1;
-  DBUG_PRINT("info",("spider link_statuses[%d]=%ld",
-    link_idx, share->link_statuses[link_idx]));
-  DBUG_RETURN(error_num);
-}
+/**
+  Read a table field and update a link_status of a spider share.
 
+  @param table     The system table (`spider_tables` table) to read the
+                   field from
+  @param share     The share to update its link status with
+  @param link_idx  Which link status to update
+  @param mem_root  MEM_ROOT for allocating
+  @reval 0 for success, or error num.
+*/
 int spider_get_sys_tables_link_status(
   TABLE *table,
   long *link_status,
   MEM_ROOT *mem_root
-) {
+)
+{
   char *ptr;
   int error_num = 0;
   DBUG_ENTER("spider_get_sys_tables_link_status");
@@ -2702,7 +2693,6 @@ int spider_get_sys_tables_link_status(
     *link_status = (long) my_strtoll10(ptr, (char**) NULL, &error_num);
   else
     *link_status = 1;
-  DBUG_PRINT("info",("spider link_statuses=%ld", *link_status));
   DBUG_RETURN(error_num);
 }
 
@@ -3209,6 +3199,14 @@ int spider_get_sys_link_mon_connect_info(
   DBUG_RETURN(error_num);
 }
 
+/**
+  Read link statuses from the spider_tables system table into a spider share
+
+  @param table     The table to read from
+  @param share     The spider share
+  @param mem_root  MEM_ROOT for allocating
+  @reval 0 for success, or error code
+*/
 int spider_get_link_statuses(
   TABLE *table,
   SPIDER_SHARE *share,
@@ -3227,14 +3225,10 @@ int spider_get_link_statuses(
     {
       if (
         (error_num == HA_ERR_KEY_NOT_FOUND || error_num == HA_ERR_END_OF_FILE)
-      ) {
-/*
-        table->file->print_error(error_num, MYF(0));
-*/
+      )
         DBUG_RETURN(error_num);
-      }
-    } else if ((error_num =
-      spider_get_sys_tables_link_status(table, share, roop_count, mem_root)))
+    } else if ((error_num= spider_get_sys_tables_link_status(table,
+                  &share->link_statuses[roop_count], mem_root)))
     {
       table->file->print_error(error_num, MYF(0));
       DBUG_RETURN(error_num);
@@ -3251,7 +3245,7 @@ int spider_get_link_statuses(
   @param name_length  Length of `name`
   @param stat         The table status that will be stored into the
                       system sts table
-  @param need_lock    Unused (fixme)
+  @reval 0 for success, or error code
 */
 int spider_sys_insert_or_update_table_sts(
   THD *thd,
@@ -3578,7 +3572,6 @@ error:
   DBUG_RETURN(error_num);
 }
 
-#ifdef SPIDER_use_LEX_CSTRING_for_Field_blob_constructor
 TABLE *spider_mk_sys_tmp_table(
   THD *thd,
   TABLE *table,
@@ -3586,15 +3579,6 @@ TABLE *spider_mk_sys_tmp_table(
   const LEX_CSTRING *field_name,
   CHARSET_INFO *cs
 )
-#else
-TABLE *spider_mk_sys_tmp_table(
-  THD *thd,
-  TABLE *table,
-  TMP_TABLE_PARAM *tmp_tbl_prm,
-  const char *field_name,
-  CHARSET_INFO *cs
-)
-#endif
 {
   Field_blob *field;
   Item_field *i_field;
@@ -3641,7 +3625,6 @@ void spider_rm_sys_tmp_table(
   DBUG_VOID_RETURN;
 }
 
-#ifdef SPIDER_use_LEX_CSTRING_for_Field_blob_constructor
 TABLE *spider_mk_sys_tmp_table_for_result(
   THD *thd,
   TABLE *table,
@@ -3651,17 +3634,6 @@ TABLE *spider_mk_sys_tmp_table_for_result(
   const LEX_CSTRING *field_name3,
   CHARSET_INFO *cs
 )
-#else
-TABLE *spider_mk_sys_tmp_table_for_result(
-  THD *thd,
-  TABLE *table,
-  TMP_TABLE_PARAM *tmp_tbl_prm,
-  const char *field_name1,
-  const char *field_name2,
-  const char *field_name3,
-  CHARSET_INFO *cs
-)
-#endif
 {
   Field_blob *field1, *field2, *field3;
   Item_field *i_field1, *i_field2, *i_field3;
