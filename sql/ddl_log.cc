@@ -1349,7 +1349,8 @@ static int ddl_log_execute_action(THD *thd, MEM_ROOT *mem_root,
   {
     if (!(file= create_handler(thd, mem_root, &handler_name)))
     {
-      error= 1;
+      /* report_error is not possible without file */
+      report_error= 0;
       goto end;
     }
     hton= file->ht;
@@ -1544,6 +1545,7 @@ static int ddl_log_execute_action(THD *thd, MEM_ROOT *mem_root,
       {
         error= file->ha_rename_table(ddl_log_entry->from_name.str,
                                      ddl_log_entry->name.str);
+        DBUG_ASSERT(!(ddl_log_entry->flags & DDL_LOG_FLAG_UPDATE_STAT));
 
       }
       else
@@ -1554,11 +1556,11 @@ static int ddl_log_execute_action(THD *thd, MEM_ROOT *mem_root,
                                     &ddl_log_entry->from_db,
                                     &ddl_log_entry->from_name,
                                     fn_flags, from_path, to_path);
-      }
-      if (ddl_log_entry->flags & DDL_LOG_FLAG_UPDATE_STAT)
-      {
-        /* Update stat tables last */
-        rename_in_stat_tables(thd, ddl_log_entry, 0);
+        if (ddl_log_entry->flags & DDL_LOG_FLAG_UPDATE_STAT)
+        {
+          /* Update stat tables last */
+          rename_in_stat_tables(thd, ddl_log_entry, 0);
+        }
       }
 
       /* disable the entry and sync */
@@ -2068,7 +2070,7 @@ static int ddl_log_execute_action(THD *thd, MEM_ROOT *mem_root,
     if (!(org_file= create_handler(thd, mem_root,
                                    &ddl_log_entry->from_handler_name)))
     {
-      error= 1;
+      report_error= 0;
       goto end;
     }
     /* Handlerton of the final table and any temporary tables */
@@ -2382,10 +2384,7 @@ static int ddl_log_execute_action(THD *thd, MEM_ROOT *mem_root,
         Query length is stored in unique_id
       */
       if (recovery_state.query.alloc((size_t) (ddl_log_entry->unique_id+1)))
-      {
-        error= 1;
         goto end;
-      }
       recovery_state.query.length(0);
       recovery_state.db.copy(ddl_log_entry->db.str, ddl_log_entry->db.length,
                              system_charset_info);
@@ -3762,6 +3761,7 @@ err:
 }
 
 
+#ifdef WITH_PARTITION_STORAGE_ENGINE
 /**
   Log an delete frm file and par file
 
@@ -3779,7 +3779,6 @@ bool ddl_log_delete_frm(DDL_LOG_STATE *ddl_state, const char *to_path)
   ddl_log_entry.next_entry= ddl_state->list ? ddl_state->list->entry_pos : 0;
 
   mysql_mutex_assert_owner(&LOCK_gdl);
-#ifdef WITH_PARTITION_STORAGE_ENGINE
   strxmov(to_file, to_path, PAR_EXT, NullS);
   lex_string_set(&ddl_log_entry.name, to_file);
   if (ddl_log_write_entry(&ddl_log_entry, &log_entry))
@@ -3787,7 +3786,6 @@ bool ddl_log_delete_frm(DDL_LOG_STATE *ddl_state, const char *to_path)
 
   ddl_log_add_entry(ddl_state, log_entry);
   ddl_log_entry.next_entry= ddl_state->list->entry_pos;
-#endif
   strxmov(to_file, to_path, reg_ext, NullS);
   lex_string_set(&ddl_log_entry.name, to_file);
   if (ddl_log_write_entry(&ddl_log_entry, &log_entry))
@@ -3809,6 +3807,7 @@ bool ddl_log_rename_frm(DDL_LOG_STATE *ddl_state,
                         const char *from_path, const char *to_path)
 {
   char to_file[FN_REFLEN + 1], from_file[FN_REFLEN + 1];
+  size_t len;
   DDL_LOG_ENTRY ddl_log_entry;
   DDL_LOG_MEMORY_ENTRY *log_entry;
   DBUG_ENTER("ddl_log_rename_frm");
@@ -3818,21 +3817,19 @@ bool ddl_log_rename_frm(DDL_LOG_STATE *ddl_state,
   ddl_log_entry.next_entry= ddl_state->list ? ddl_state->list->entry_pos : 0;
 
   mysql_mutex_assert_owner(&LOCK_gdl);
-#ifdef WITH_PARTITION_STORAGE_ENGINE
-  strxmov(to_file, to_path, PAR_EXT, NullS);
-  strxmov(from_file, from_path, PAR_EXT, NullS);
-  lex_string_set(&ddl_log_entry.name, to_file);
-  lex_string_set(&ddl_log_entry.from_name, from_file);
+  len= (strxmov(to_file, to_path, PAR_EXT, NullS) - to_file);
+  lex_string_set3(&ddl_log_entry.name, to_file, len);
+  len =(strxmov(from_file, from_path, PAR_EXT, NullS) - from_file);
+  lex_string_set3(&ddl_log_entry.from_name, from_file, len);
   if (ddl_log_write_entry(&ddl_log_entry, &log_entry))
     DBUG_RETURN(1);
 
   ddl_log_add_entry(ddl_state, log_entry);
   ddl_log_entry.next_entry= ddl_state->list->entry_pos;
-#endif
-  strxmov(to_file, to_path, reg_ext, NullS);
-  strxmov(from_file, from_path, reg_ext, NullS);
-  lex_string_set(&ddl_log_entry.name, to_file);
-  lex_string_set(&ddl_log_entry.from_name, from_file);
+  len= (strxmov(to_file, to_path, reg_ext, NullS) - to_file);
+  lex_string_set3(&ddl_log_entry.name, to_file, len);
+  len= (strxmov(from_file, from_path, reg_ext, NullS) - from_file);
+  lex_string_set3(&ddl_log_entry.from_name, from_file, len);
 
   if (ddl_log_write_entry(&ddl_log_entry, &log_entry))
     DBUG_RETURN(true);
@@ -3840,6 +3837,7 @@ bool ddl_log_rename_frm(DDL_LOG_STATE *ddl_state,
   ddl_log_add_entry(ddl_state, log_entry);
   DBUG_RETURN(false);
 }
+#endif
 
 
 /*

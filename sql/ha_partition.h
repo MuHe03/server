@@ -476,8 +476,7 @@ public:
   {
     return m_file[part_elem->serial_id(sub_elem, m_part_info->num_subparts)];
   }
-  handler *get_new_handler(partition_element *part_elem,
-                           partition_element *sub_elem)
+  handler *new_handler(partition_element *part_elem, partition_element *sub_elem)
   {
     return m_new_file[part_elem->serial_id(sub_elem, m_part_info->num_subparts)];
   }

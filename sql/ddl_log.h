@@ -373,9 +373,11 @@ bool ddl_log_alter_table(DDL_LOG_STATE *ddl_state,
                          bool is_renamed);
 bool ddl_log_store_query(THD *thd, DDL_LOG_STATE *ddl_log_state,
                          const char *query, size_t length);
+#ifdef WITH_PARTITION_STORAGE_ENGINE
 bool ddl_log_delete_frm(DDL_LOG_STATE *ddl_state, const char *to_path);
 bool ddl_log_rename_frm(DDL_LOG_STATE *ddl_state,
                         const char *from_path, const char *to_path);
+#endif
 bool ddl_log_link_chains(DDL_LOG_STATE *state, DDL_LOG_STATE *master_state);
 void ddl_log_start_atomic_block(DDL_LOG_STATE *state);
 bool ddl_log_commit_atomic_block(DDL_LOG_STATE *state);

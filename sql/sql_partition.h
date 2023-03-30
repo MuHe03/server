@@ -44,10 +44,12 @@ typedef struct st_key_range key_range;
 #define HA_USE_AUTO_PARTITION (1 << 3)
 #define HA_ONLY_VERS_PARTITION (1 << 4)
 
-#define NORMAL_PART_NAME 0
-#define TEMP_PART_NAME 1
-#define RENAMED_PART_NAME 2
-#define SKIP_PART_NAME 255
+enum enum_part_name_type {
+  NORMAL_PART_NAME= 0,
+  TEMP_PART_NAME,
+  RENAMED_PART_NAME,
+  SKIP_PART_NAME= 255
+};
 
 typedef struct st_lock_param_type
 {

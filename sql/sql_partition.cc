@@ -6135,8 +6135,8 @@ class Alter_partition_logger
 {
 protected:
   const char *path;
-  uint from_name_type; /* NORMAL_PART_NAME, TEMP_PART_NAME, RENAMED_PART_NAME */
-  uint to_name_type;   /* same + SKIP_PART_NAME */
+  enum_part_name_type from_name_type; /* NORMAL_PART_NAME, TEMP_PART_NAME, RENAMED_PART_NAME */
+  enum_part_name_type to_name_type;   /* same + SKIP_PART_NAME */
 
   DDL_LOG_ENTRY ddl_log_entry;
 
@@ -6173,8 +6173,8 @@ public:
   }
 
   virtual ~Alter_partition_logger() {}
-  bool iterate(Phase phase, uint from_name_arg, uint to_name_arg,
-               List<partition_element> *parts);
+  bool iterate(Phase phase, enum_part_name_type from_name_arg,
+               enum_part_name_type to_name_arg, List<partition_element> *parts);
 
   /**
     Make from_name, to_name according to from_name_type, to_name_type.
@@ -6383,7 +6383,7 @@ public:
       int ha_err;
       DBUG_ASSERT(table->file->ht->db_type == DB_TYPE_PARTITION_DB);
       handler *file= (phase & (RENAME_ADDED_PARTS|CONVERT_IN) ?
-                      hp->get_new_handler(part_elem, sub_elem) :
+                      hp->new_handler(part_elem, sub_elem) :
                       hp->get_child_handler(part_elem, sub_elem));
       ha_err= file->ha_rename_table(from_name, to_name);
       if (ha_err ||
@@ -6631,7 +6631,8 @@ public:
 
 
 bool Alter_partition_logger::iterate(Phase phase_arg,
-                                     uint from_name_arg, uint to_name_arg,
+                                     enum_part_name_type from_name_arg,
+                                     enum_part_name_type to_name_arg,
                                      List<partition_element> *parts)
 {
   phase= phase_arg;
