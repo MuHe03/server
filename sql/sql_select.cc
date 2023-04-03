@@ -7448,7 +7448,7 @@ best_access_path(JOIN      *join,
   loose_scan_opt.init(join, s, remaining_tables);
 
   if (s->table->is_splittable())
-    spl_plan= s->choose_best_splitting(record_count, remaining_tables);
+    spl_plan= s->choose_best_splitting(join_positions + idx, remaining_tables);
 
   if (s->keyuse)
   {                                            /* Use key if possible */
@@ -9833,6 +9833,8 @@ best_extension_by_limited_search(JOIN      *join,
 
       double partial_join_cardinality= current_record_count *
                                         pushdown_cond_selectivity;
+      join->positions[idx].partial_join_cardinality= partial_join_cardinality;
+
       if ( (search_depth > 1) && (remaining_tables & ~real_table_bit) & allowed_tables )
       { /* Recursively expand the current partial plan */
         swap_variables(JOIN_TAB*, join->best_ref[idx], *pos);
@@ -13825,7 +13827,8 @@ bool JOIN_TAB::preread_init()
     DBUG_RETURN(TRUE);
 
   if (!(derived->get_unit()->uncacheable & UNCACHEABLE_DEPENDENT) ||
-      derived->is_nonrecursive_derived_with_rec_ref())
+      derived->is_nonrecursive_derived_with_rec_ref() ||
+      is_split_derived)
     preread_init_done= TRUE;
   if (select && select->quick)
     select->quick->replace_handler(table->file);
@@ -20763,6 +20766,16 @@ enum_nested_loop_state
 sub_select(JOIN *join,JOIN_TAB *join_tab,bool end_of_records)
 {
   DBUG_ENTER("sub_select");
+
+  if (join_tab->split_derived_to_update && !end_of_records)
+  {
+    table_map tab_map= join_tab->split_derived_to_update;
+    for (uint i= 0; tab_map; i++, tab_map>>= 1)
+    {
+      if (tab_map & 1)
+        join->map2table[i]->preread_init_done= false;
+    }
+  }
 
   if (join_tab->last_inner)
   {

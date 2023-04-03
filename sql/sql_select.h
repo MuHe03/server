@@ -520,6 +520,16 @@ typedef struct st_join_table {
 
   bool preread_init_done;
 
+  /* true <=> split optimization has been applied to this materialized table */
+  bool is_split_derived;
+
+  /*
+    Bitmap of split materialized derived tables that can be filled just before
+    this join table is to be joined. All parameters of the split derived tables
+    belong to tables preceding this join table.
+  */
+  table_map split_derived_to_update;
+
   /*
     Cost info to the range filter used when joining this join table
     (Defined when the best join order has been already chosen)
@@ -680,7 +690,7 @@ typedef struct st_join_table {
 
   void partial_cleanup();
   void add_keyuses_for_splitting();
-  SplM_plan_info *choose_best_splitting(double record_count,
+  SplM_plan_info *choose_best_splitting(const POSITION *join_tab_pos,
                                         table_map remaining_tables);
   bool fix_splitting(SplM_plan_info *spl_plan, table_map remaining_tables,
                      bool is_const_table);
@@ -946,6 +956,9 @@ public:
     Other - [eq_]ref[_or_null] access is used. Pointer to {t.keypart1 = expr}
   */
   KEYUSE *key;
+
+  /* Cardinality of current partial join ending with this position */
+  double partial_join_cardinality;
 
   /* Info on splitting plan used at this position */
   SplM_plan_info *spl_plan;
