@@ -5339,7 +5339,7 @@ int spider_db_mbase_util::append_time_zone(
 /**
   Append a query for self-referencing check.
 
-  The query is setting a user variable `@spider_lc$targe_table_path`
+  The query is setting a user variable `@spider_lc$target_table_path`
   to the value of `"$spider_unique_id$spider_table_path-"`, where
   $target_table_path is the path to the data node table ("to"), and
   $spider_table_path the path to the spider table ("from").
