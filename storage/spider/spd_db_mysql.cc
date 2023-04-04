@@ -13456,6 +13456,95 @@ int spider_mbase_handler::sts_mode_exchange(
   DBUG_RETURN(sts_mode);
 }
 
+/** Set the global lock wait time out */
+int spider_db_mbase::set_lock_wait_timeout(int timeout)
+{
+  DBUG_ENTER("spider_db_set_lock_wait_timeout");
+  const LEX_CSTRING query = {STRING_WITH_LEN(
+      "set @old_lock_wait_timeout=@@global.lock_wait_timeout;"
+      "set global lock_wait_timeout=1;")};
+  int error_num;
+  if ((error_num = exec_query(query.str, query.length, -1)))
+    DBUG_RETURN(error_num);
+  spider_db_result *result;
+  do {
+    st_spider_db_request_key request_key;
+    request_key.spider_thread_id = 1;
+    request_key.query_id = 1;
+    request_key.handler = NULL;
+    request_key.request_id = 1;
+    request_key.next = NULL;
+    if ((result = conn->db_conn->store_result(NULL, &request_key,
+                                              &error_num)))
+    {
+      result->free_result();
+      delete result;
+    } else if ((error_num = conn->db_conn->get_errno()))
+    {
+      break;
+    }
+  } while (!(error_num = conn->db_conn->next_result()));
+  DBUG_RETURN(0);
+}
+
+/** Reset the global lock wait time out */
+int spider_db_mbase::reset_lock_wait_timeout()
+{
+  DBUG_ENTER("spider_db_set_lock_wait_timeout");
+  const LEX_CSTRING query = {STRING_WITH_LEN(
+      "set global lock_wait_timeout=@old_lock_wait_timeout;")};
+  int error_num;
+  if ((error_num = exec_query(query.str, query.length, -1)))
+  {
+    spider_db_result *result;
+    do {
+      st_spider_db_request_key request_key;
+      request_key.spider_thread_id = 1;
+      request_key.query_id = 1;
+      request_key.handler = NULL;
+      request_key.request_id = 1;
+      request_key.next = NULL;
+      if ((result = conn->db_conn->store_result(NULL, &request_key,
+                                                &error_num)))
+      {
+        result->free_result();
+        delete result;
+      } else if ((error_num = conn->db_conn->get_errno()))
+      {
+        break;
+      }
+    } while (!(error_num= conn->db_conn->next_result()));
+  }
+  DBUG_RETURN(0);
+}
+
+void spider_setup_for_query(ha_spider *spider, SPIDER_CONN *conn, int link_idx)
+{
+  pthread_mutex_assert_not_owner(&conn->mta_conn_mutex);
+  pthread_mutex_lock(&conn->mta_conn_mutex);
+  SPIDER_SET_FILE_POS(&conn->mta_conn_mutex_file_pos);
+  conn->need_mon= &spider->need_mons[link_idx];
+  DBUG_ASSERT(!conn->mta_conn_mutex_lock_already);
+  DBUG_ASSERT(!conn->mta_conn_mutex_unlock_later);
+  conn->mta_conn_mutex_lock_already= TRUE;
+  conn->mta_conn_mutex_unlock_later= TRUE;
+  conn->disable_connect_retry= TRUE;
+}
+
+int spider_teardown_after_query(SPIDER_CONN *conn, int error_num, bool clear)
+{
+  conn->disable_connect_retry= FALSE;
+  DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
+  DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
+  conn->mta_conn_mutex_lock_already= FALSE;
+  conn->mta_conn_mutex_unlock_later= FALSE;
+  if (clear)
+  {
+    SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
+    pthread_mutex_unlock(&conn->mta_conn_mutex);
+  }
+  return error_num;
+}
 /**
   Executes show table status query and stores results in share->stat.
 */
@@ -13472,325 +13561,116 @@ int spider_mbase_handler::show_table_status(
   DBUG_ENTER("spider_mbase_handler::show_table_status");
   DBUG_PRINT("info",("spider sts_mode=%d", sts_mode));
 
-  if (sts_mode == 1)
+  spider_setup_for_query(spider, conn, link_idx);
+  spider_conn_set_timeout_from_share(
+    conn, link_idx, spider->wide_handler->trx->thd, share);
+  if ((error_num = spider_db_set_names(spider, conn, link_idx)) ||
+      (error_num =
+       ((spider_db_mbase *) conn->db_conn)->set_lock_wait_timeout(1)) ||
+      /* Executes the `show table status` query */
+      (spider_db_query(
+        conn,
+        mysql_share->show_table_status[0 + pos].ptr(),
+        mysql_share->show_table_status[0 + pos].length(),
+        -1,
+        &spider->need_mons[link_idx]) &&
+       (error_num = spider_db_errorno(conn))))
   {
-    pthread_mutex_assert_not_owner(&conn->mta_conn_mutex);
-    pthread_mutex_lock(&conn->mta_conn_mutex);
-    SPIDER_SET_FILE_POS(&conn->mta_conn_mutex_file_pos);
-    conn->need_mon = &spider->need_mons[link_idx];
-    DBUG_ASSERT(!conn->mta_conn_mutex_lock_already);
-    DBUG_ASSERT(!conn->mta_conn_mutex_unlock_later);
-    conn->mta_conn_mutex_lock_already = TRUE;
-    conn->mta_conn_mutex_unlock_later = TRUE;
-    conn->disable_connect_retry = TRUE;
-    spider_conn_set_timeout_from_share(conn, link_idx,
-      spider->wide_handler->trx->thd,
-      share);
-    if (
-      (error_num = spider_db_set_names(spider, conn, link_idx)) ||
-      ( /* Executes the `show table status` query */
-        spider_db_query(
-          conn,
-          mysql_share->show_table_status[0 + pos].ptr(),
-          mysql_share->show_table_status[0 + pos].length(),
-          -1,
-          &spider->need_mons[link_idx]) &&
-        (error_num = spider_db_errorno(conn))
-      )
-    ) {
-      if (
-        error_num == ER_SPIDER_REMOTE_SERVER_GONE_AWAY_NUM &&
-        !conn->disable_reconnect
+    if (error_num == ER_SPIDER_REMOTE_SERVER_GONE_AWAY_NUM &&
+        !conn->disable_reconnect)
+    {
+      /* retry */
+      if ((error_num = spider_db_ping(spider, conn, link_idx)))
+        DBUG_RETURN(spider_teardown_after_query(conn, error_num, true));
+      if ((error_num = spider_db_set_names(spider, conn, link_idx)))
+        DBUG_RETURN(spider_teardown_after_query(conn, error_num, true));
+      spider_conn_set_timeout_from_share(conn, link_idx,
+                                         spider->wide_handler->trx->thd,
+                                         share);
+      if ((error_num =
+           ((spider_db_mbase *) conn->db_conn)->set_lock_wait_timeout(1)))
+        DBUG_RETURN(spider_teardown_after_query(conn, error_num, true));
+      if (spider_db_query(
+            conn,
+            mysql_share->show_table_status[0 + pos].ptr(),
+            mysql_share->show_table_status[0 + pos].length(),
+            -1,
+            &spider->need_mons[link_idx])
       ) {
-        /* retry */
-        if ((error_num = spider_db_ping(spider, conn, link_idx)))
-        {
-          conn->disable_connect_retry = FALSE;
-          DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-          DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-          conn->mta_conn_mutex_lock_already = FALSE;
-          conn->mta_conn_mutex_unlock_later = FALSE;
-          SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-          pthread_mutex_unlock(&conn->mta_conn_mutex);
-          DBUG_RETURN(error_num);
-        }
-        if ((error_num = spider_db_set_names(spider, conn, link_idx)))
-        {
-          conn->disable_connect_retry = FALSE;
-          DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-          DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-          conn->mta_conn_mutex_lock_already = FALSE;
-          conn->mta_conn_mutex_unlock_later = FALSE;
-          SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-          pthread_mutex_unlock(&conn->mta_conn_mutex);
-          DBUG_RETURN(error_num);
-        }
-        spider_conn_set_timeout_from_share(conn, link_idx,
-          spider->wide_handler->trx->thd,
-          share);
-        if (spider_db_query(
-          conn,
-          mysql_share->show_table_status[0 + pos].ptr(),
-          mysql_share->show_table_status[0 + pos].length(),
-          -1,
-          &spider->need_mons[link_idx])
-        ) {
-          conn->disable_connect_retry = FALSE;
-          DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-          DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-          conn->mta_conn_mutex_lock_already = FALSE;
-          conn->mta_conn_mutex_unlock_later = FALSE;
-          DBUG_RETURN(spider_db_errorno(conn));
-        }
-      } else {
-        conn->disable_connect_retry = FALSE;
-        DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-        DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-        conn->mta_conn_mutex_lock_already = FALSE;
-        conn->mta_conn_mutex_unlock_later = FALSE;
-        SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-        pthread_mutex_unlock(&conn->mta_conn_mutex);
-        DBUG_RETURN(error_num);
+        spider_teardown_after_query(conn, 0, false);
+        DBUG_RETURN(spider_db_errorno(conn));
       }
-    }
-    st_spider_db_request_key request_key;
-    request_key.spider_thread_id = spider->wide_handler->trx->spider_thread_id;
-    request_key.query_id = spider->wide_handler->trx->thd->query_id;
-    request_key.handler = spider;
-    request_key.request_id = 1;
-    request_key.next = NULL;
-    if (spider_param_dry_access())
+    } else
+      DBUG_RETURN(spider_teardown_after_query(conn, error_num, true));
+  }
+  st_spider_db_request_key request_key = {
+    spider->wide_handler->trx->spider_thread_id,
+    spider->wide_handler->trx->thd->query_id, spider, 1, NULL};
+  if (spider_param_dry_access())
+    DBUG_RETURN(spider_teardown_after_query(conn, 0, true));
+  if (!(res = conn->db_conn->store_result(NULL, &request_key, &error_num)))
+  {
+    if (sts_mode == 1)          /* get from status table */
     {
-      conn->disable_connect_retry = FALSE;
-      DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-      DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-      conn->mta_conn_mutex_lock_already = FALSE;
-      conn->mta_conn_mutex_unlock_later = FALSE;
-      SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-      pthread_mutex_unlock(&conn->mta_conn_mutex);
-      DBUG_RETURN(0);
-    }
-    if (!(res = conn->db_conn->store_result(NULL, &request_key, &error_num)))
-    {
-      conn->disable_connect_retry = FALSE;
-      DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-      DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-      conn->mta_conn_mutex_lock_already = FALSE;
-      conn->mta_conn_mutex_unlock_later = FALSE;
       if (error_num)
+        DBUG_RETURN(spider_teardown_after_query(conn, error_num, true));
+      spider_teardown_after_query(conn, 0, false);
+      if ((error_num = spider_db_errorno(conn)))
+        DBUG_RETURN(error_num);
+      else
       {
-        SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-        pthread_mutex_unlock(&conn->mta_conn_mutex);
-        DBUG_RETURN(error_num);
-      }
-      else if ((error_num = spider_db_errorno(conn)))
-        DBUG_RETURN(error_num);
-      else {
-        my_printf_error(ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM,
+        my_printf_error(
+          ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM,
           ER_SPIDER_REMOTE_TABLE_NOT_FOUND_STR, MYF(0),
           mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
-          mysql_share->table_names_str[spider->conn_link_idx[
-            link_idx]].ptr());
+          mysql_share->table_names_str[spider->conn_link_idx[link_idx]].ptr());
         DBUG_RETURN(ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM);
       }
-    }
-    conn->disable_connect_retry = FALSE;
-    DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-    DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-    conn->mta_conn_mutex_lock_already = FALSE;
-    conn->mta_conn_mutex_unlock_later = FALSE;
-    SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-    pthread_mutex_unlock(&conn->mta_conn_mutex);
-    /* Fetches query results into share->stat. */
-    error_num = res->fetch_table_status(
-      sts_mode,
-      share->stat
-    );
-    auto_increment_value = share->stat.auto_increment_value;
-    res->free_result();
-    delete res;
-    if (error_num)
+    } else                      /* get from information schema */
     {
-      switch (error_num)
-      {
-        case ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM:
-          my_printf_error(ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM,
-            ER_SPIDER_REMOTE_TABLE_NOT_FOUND_STR, MYF(0),
-            mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
-            mysql_share->table_names_str[spider->conn_link_idx[
-              link_idx]].ptr());
-          break;
-        case ER_SPIDER_INVALID_REMOTE_TABLE_INFO_NUM:
-          my_printf_error(ER_SPIDER_INVALID_REMOTE_TABLE_INFO_NUM,
-            ER_SPIDER_INVALID_REMOTE_TABLE_INFO_STR, MYF(0),
-            mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
-            mysql_share->table_names_str[spider->conn_link_idx[
-              link_idx]].ptr());
-          break;
-        default:
-          break;
-      }
-      DBUG_RETURN(error_num);
-    }
-  } else {
-    pthread_mutex_assert_not_owner(&conn->mta_conn_mutex);
-    pthread_mutex_lock(&conn->mta_conn_mutex);
-    SPIDER_SET_FILE_POS(&conn->mta_conn_mutex_file_pos);
-    conn->need_mon = &spider->need_mons[link_idx];
-    DBUG_ASSERT(!conn->mta_conn_mutex_lock_already);
-    DBUG_ASSERT(!conn->mta_conn_mutex_unlock_later);
-    conn->mta_conn_mutex_lock_already = TRUE;
-    conn->mta_conn_mutex_unlock_later = TRUE;
-    conn->disable_connect_retry = TRUE;
-    spider_conn_set_timeout_from_share(conn, link_idx,
-      spider->wide_handler->trx->thd,
-      share);
-    if (
-      (error_num = spider_db_set_names(spider, conn, link_idx)) ||
-      (
-        spider_db_query(
-          conn,
-          mysql_share->show_table_status[1 + pos].ptr(),
-          mysql_share->show_table_status[1 + pos].length(),
-          -1,
-          &spider->need_mons[link_idx]) &&
-        (error_num = spider_db_errorno(conn))
-      )
-    ) {
-      if (
-        error_num == ER_SPIDER_REMOTE_SERVER_GONE_AWAY_NUM &&
-        !conn->disable_reconnect
-      ) {
-        /* retry */
-        if ((error_num = spider_db_ping(spider, conn, link_idx)))
-        {
-          conn->disable_connect_retry = FALSE;
-          DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-          DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-          conn->mta_conn_mutex_lock_already = FALSE;
-          conn->mta_conn_mutex_unlock_later = FALSE;
-          SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-          pthread_mutex_unlock(&conn->mta_conn_mutex);
-          DBUG_RETURN(error_num);
-        }
-        if ((error_num = spider_db_set_names(spider, conn, link_idx)))
-        {
-          conn->disable_connect_retry = FALSE;
-          DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-          DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-          conn->mta_conn_mutex_lock_already = FALSE;
-          conn->mta_conn_mutex_unlock_later = FALSE;
-          SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-          pthread_mutex_unlock(&conn->mta_conn_mutex);
-          DBUG_RETURN(error_num);
-        }
-        spider_conn_set_timeout_from_share(conn, link_idx,
-          spider->wide_handler->trx->thd,
-          share);
-        if (spider_db_query(
-          conn,
-          mysql_share->show_table_status[1 + pos].ptr(),
-          mysql_share->show_table_status[1 + pos].length(),
-          -1,
-          &spider->need_mons[link_idx])
-        ) {
-          conn->disable_connect_retry = FALSE;
-          DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-          DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-          conn->mta_conn_mutex_lock_already = FALSE;
-          conn->mta_conn_mutex_unlock_later = FALSE;
-          DBUG_RETURN(spider_db_errorno(conn));
-        }
-      } else {
-        conn->disable_connect_retry = FALSE;
-        DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-        DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-        conn->mta_conn_mutex_lock_already = FALSE;
-        conn->mta_conn_mutex_unlock_later = FALSE;
-        SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-        pthread_mutex_unlock(&conn->mta_conn_mutex);
-        DBUG_RETURN(error_num);
-      }
-    }
-    st_spider_db_request_key request_key;
-    request_key.spider_thread_id = spider->wide_handler->trx->spider_thread_id;
-    request_key.query_id = spider->wide_handler->trx->thd->query_id;
-    request_key.handler = spider;
-    request_key.request_id = 1;
-    request_key.next = NULL;
-    if (spider_param_dry_access())
-    {
-      conn->disable_connect_retry = FALSE;
-      DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-      DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-      conn->mta_conn_mutex_lock_already = FALSE;
-      conn->mta_conn_mutex_unlock_later = FALSE;
-      SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-      pthread_mutex_unlock(&conn->mta_conn_mutex);
-      DBUG_RETURN(0);
-    }
-    if (!(res = conn->db_conn->store_result(NULL, &request_key, &error_num)))
-    {
-      conn->disable_connect_retry = FALSE;
-      DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-      DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-      conn->mta_conn_mutex_lock_already = FALSE;
-      conn->mta_conn_mutex_unlock_later = FALSE;
-      if (error_num || (error_num = spider_db_errorno(conn)))
+      spider_teardown_after_query(conn, error_num, false);
+      if (error_num || (error_num= spider_db_errorno(conn)))
         DBUG_RETURN(error_num);
       else
         DBUG_RETURN(ER_QUERY_ON_FOREIGN_DATA_SOURCE);
     }
-    conn->disable_connect_retry = FALSE;
-    DBUG_ASSERT(conn->mta_conn_mutex_lock_already);
-    DBUG_ASSERT(conn->mta_conn_mutex_unlock_later);
-    conn->mta_conn_mutex_lock_already = FALSE;
-    conn->mta_conn_mutex_unlock_later = FALSE;
-    SPIDER_CLEAR_FILE_POS(&conn->mta_conn_mutex_file_pos);
-    pthread_mutex_unlock(&conn->mta_conn_mutex);
-    error_num = res->fetch_table_status(
-      sts_mode,
-      share->stat
-    );
-    auto_increment_value = share->stat.auto_increment_value;
-    res->free_result();
-    delete res;
-    if (error_num)
-    {
-      switch (error_num)
-      {
-        case ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM:
-          my_printf_error(ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM,
-            ER_SPIDER_REMOTE_TABLE_NOT_FOUND_STR, MYF(0),
-            mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
-            mysql_share->table_names_str[spider->conn_link_idx[
-              link_idx]].ptr());
-          break;
-        case ER_SPIDER_INVALID_REMOTE_TABLE_INFO_NUM:
-          my_printf_error(ER_SPIDER_INVALID_REMOTE_TABLE_INFO_NUM,
-            ER_SPIDER_INVALID_REMOTE_TABLE_INFO_STR, MYF(0),
-            mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
-            mysql_share->table_names_str[spider->conn_link_idx[
-              link_idx]].ptr());
-          break;
-        default:
-          break;
-      }
-      DBUG_RETURN(error_num);
-    }
   }
-  if ((error_num = ((spider_db_mbase *) conn->db_conn)->print_warnings(NULL)))
+  spider_teardown_after_query(conn, 0, true);
+  /* Fetches query results into share->stat. */
+  error_num = res->fetch_table_status(sts_mode, share->stat);
+  auto_increment_value = share->stat.auto_increment_value;
+  res->free_result();
+  delete res;
+  if (error_num)
   {
+    switch (error_num)
+    {
+    case ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM:
+      my_printf_error(ER_SPIDER_REMOTE_TABLE_NOT_FOUND_NUM,
+                      ER_SPIDER_REMOTE_TABLE_NOT_FOUND_STR, MYF(0),
+                      mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
+                      mysql_share->table_names_str[spider->conn_link_idx[
+                          link_idx]].ptr());
+      break;
+    case ER_SPIDER_INVALID_REMOTE_TABLE_INFO_NUM:
+      my_printf_error(ER_SPIDER_INVALID_REMOTE_TABLE_INFO_NUM,
+                      ER_SPIDER_INVALID_REMOTE_TABLE_INFO_STR, MYF(0),
+                      mysql_share->db_names_str[spider->conn_link_idx[link_idx]].ptr(),
+                      mysql_share->table_names_str[spider->conn_link_idx[
+                          link_idx]].ptr());
+      break;
+    default:
+      break;
+    }
     DBUG_RETURN(error_num);
   }
+
+  if ((error_num = ((spider_db_mbase *) conn->db_conn)->print_warnings(NULL)))
+    DBUG_RETURN(error_num);
   if (share->static_records_for_status != -1)
-  {
     share->stat.records = (ha_rows) share->static_records_for_status;
-  }
   if (share->static_mean_rec_length != -1)
-  {
     share->stat.mean_rec_length = (ulong) share->static_mean_rec_length;
-  }
   if (auto_increment_value > share->lgtm_tblhnd_share->auto_increment_value)
   {
     share->lgtm_tblhnd_share->auto_increment_value = auto_increment_value;
