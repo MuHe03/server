@@ -4582,49 +4582,32 @@ error_alloc_share:
 */
 int spider_check_for_self_reference(THD *thd, const TABLE_SHARE *share)
 {
-  LEX_CSTRING target;
-  uint buf_sz;
-  char *loop_check_buf;
+  String target(0);
+  LEX_CSTRING key;
   DBUG_ENTER("spider_check_for_self_reference");
 
-  target.length = share->path.length + SPIDER_SQL_LOP_CHK_PRM_PRF_LEN;
-  buf_sz = spider_unique_id.length > SPIDER_SQL_LOP_CHK_PRM_PRF_LEN ?
-    share->path.length + spider_unique_id.length + 2 :
-    target.length + 2;
-  loop_check_buf = (char *) my_alloca(buf_sz);
-  if (unlikely(!loop_check_buf))
-      DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-  target.str = loop_check_buf + buf_sz - target.length - 2;
-  memcpy((void *) target.str,
-         SPIDER_SQL_LOP_CHK_PRM_PRF_STR, SPIDER_SQL_LOP_CHK_PRM_PRF_LEN);
-  memcpy((void *) (target.str + SPIDER_SQL_LOP_CHK_PRM_PRF_LEN),
-         share->path.str, share->path.length);
-  ((char *) target.str)[target.length] = '\0';
-  DBUG_PRINT("info",("spider loop check param name=%s", target.str));
-  const user_var_entry *loop_check=
-    get_variable(&thd->user_vars, &target, FALSE);
+  target.append(STRING_WITH_LEN(SPIDER_SQL_LOP_CHK_PRM_PRF_STR));
+  target.append(share->path);
+  DBUG_PRINT("info",("spider loop check param name=%s", target.c_ptr()));
+  key = target.to_lex_cstring();
+  const user_var_entry *loop_check= get_variable(&thd->user_vars, &key, FALSE);
   if (loop_check && loop_check->type == STRING_RESULT)
+  {
+    String expected(0);
+    expected.append(spider_unique_id);
+    expected.append(share->path);
+    expected.append(STRING_WITH_LEN("-"));
+    DBUG_PRINT("info",("spider loop check expected=%s", expected.c_ptr()));
+    DBUG_PRINT("info",("spider loop check param value=%s",
+                       loop_check->value));
+    if (unlikely(strstr(loop_check->value, expected.c_ptr())))
     {
-      target.length = share->path.length + spider_unique_id.length + 1;
-      target.str = loop_check_buf + buf_sz - share->path.length -
-        spider_unique_id.length - 2;
-      memcpy((void *) target.str, spider_unique_id.str,
-             spider_unique_id.length);
-      ((char *) target.str)[target.length - 1] = '-';
-      ((char *) target.str)[target.length] = '\0';
-      DBUG_PRINT("info",("spider loop check key=%s", target.str));
-      DBUG_PRINT("info",("spider loop check param value=%s",
-                         loop_check->value));
-      if (unlikely(strstr(loop_check->value, target.str)))
-        {
-          const int error_num= ER_SPIDER_INFINITE_LOOP_NUM;
-          my_printf_error(error_num, ER_SPIDER_INFINITE_LOOP_STR, MYF(0),
-                          share->db.str, share->table_name.str);
-          my_afree(loop_check_buf);
-          DBUG_RETURN(error_num);
-        }
+      const int error_num = ER_SPIDER_INFINITE_LOOP_NUM;
+      my_printf_error(error_num, ER_SPIDER_INFINITE_LOOP_STR, MYF(0),
+                      share->db.str, share->table_name.str);
+      DBUG_RETURN(error_num);
     }
-  my_afree(loop_check_buf);
+  }
   DBUG_RETURN(0);
 }
 
