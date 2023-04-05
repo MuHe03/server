@@ -1,0 +1,61 @@
+#
+#   When replicating MDL events for a table that uses system versioning without
+# primary keys, ensure that for data sets with duplicate records, the updates
+# to these records with duplicates are enacted on the correct row. That is,
+# there was a bug (reported in MDEV-30430) such that the function to find the
+# row to update would stop after finding the first matching record. However, in
+# the absence of primary keys, the version of the record is needed to compare
+# the row to ensure we are updating the correct one.
+#
+#   We test this by replicating a system versioned table consisting of two
+# duplicate records, and replicating a transaction that deletes them. In the
+# buggy version, one of the records will remain on the replica; and in the
+# patched version, both records will be deleted.
+#
+#
+# References:
+#   MDEV-30430: Enabling system versioning on tables without primary key breaks
+#               replication
+#
+--source include/master-slave.inc
+--source include/have_innodb.inc
+
+--source include/have_binlog_format_row.inc
+
+--echo #
+--echo # Initialize test data
+--connection master
+CREATE TABLE t1 (a INT) engine=innodb WITH SYSTEM VERSIONING;
+insert into t1 values (1);
+insert into t1 values (1);
+--source include/save_master_gtid.inc
+
+--connection slave
+--source include/sync_with_master_gtid.inc
+
+--echo # Delete the duplicate records, which will create an update rows log
+--echo # event for two rows: one for each deleted record
+--connection master
+delete from t1;
+--source include/save_master_gtid.inc
+--connection slave
+--source include/sync_with_master_gtid.inc
+
+--echo # Primary and Replica tables should match
+--let $diff_tables= master:test.t1,slave:test.t1
+--source include/diff_tables.inc
+
+
+--echo #
+--echo # Cleanup
+--connection master
+DROP TABLE t1;
+--source include/save_master_gtid.inc
+
+--connection slave
+--source include/sync_with_master_gtid.inc
+
+--source include/rpl_end.inc
+
+--echo # End of tests
+

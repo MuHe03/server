@@ -1,0 +1,29 @@
+include/master-slave.inc
+[connection master]
+#
+# Initialize test data
+connection master;
+CREATE TABLE t1 (a INT) engine=innodb WITH SYSTEM VERSIONING;
+insert into t1 values (1);
+insert into t1 values (1);
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+# Delete the duplicate records, which will create an update rows log
+# event for two rows: one for each deleted record
+connection master;
+delete from t1;
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+# Primary and Replica tables should match
+include/diff_tables.inc [master:test.t1,slave:test.t1]
+#
+# Cleanup
+connection master;
+DROP TABLE t1;
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+include/rpl_end.inc
+# End of tests
