@@ -476,10 +476,13 @@ read_slot:
     /* Avoid optimizing tables that were optimized recently. */
     if (slot->last_run > 0 && lint(interval) >= 0
         && interval < FTS_OPTIMIZE_INTERVAL_IN_SECS)
-    {
-      current++;
-      goto read_slot;
-    }
+      goto read_next;
+  }
+  else
+  {
+read_next:
+    current++;
+    goto read_slot;
   }
   dict_table_t *table= slot->table;
   /* Update in_process */
