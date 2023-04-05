@@ -13906,7 +13906,12 @@ static bool record_compare(TABLE *table)
   /* Compare fields */
   for (Field **ptr=table->field ; *ptr ; ptr++)
   {
-    if (table->versioned() && (*ptr)->vers_sys_field())
+    /*
+      If the table doesn't have a primary key, we need the version to identify
+      the record so we don't inadvertently update duplicate rows
+    */
+    if (table->versioned() && table->s->primary_key < MAX_KEY &&
+        (*ptr)->vers_sys_field())
     {
       continue;
     }
